@@ -1,4 +1,5 @@
-"""The model: a pretrained LLM torso with its LM head removed, plus a pointer readout.
+"""The model: a pretrained LLM torso with its LM head removed, plus a pointer readout
+(or, opt-in, a token readout; see TokenReadoutHead).
 
     input -> [LLM torso] -> hidden states -> [PointerHead] -> one logit per option
 
@@ -66,12 +67,14 @@ class StrandsDeciderConfig:
     # at all, so this is where the context curve goes flat.
     max_length: int = 3072
     torch_dtype: str = "bfloat16"
-    # Not read by this version (the pointer head is the only readout); kept on the config
-    # so every export writes `head_type: "pointer"` into its JSON. Older strands-decider
-    # versions default a missing head_type to "slot" and crash loading a pointer export,
-    # and out-of-tree readers may parse this field directly.
+    # "pointer" (PointerHead, the default) or "token_readout" (TokenReadoutHead). Written into
+    # every export's JSON: older strands-decider versions default a missing head_type to "slot"
+    # and crash loading a pointer export, and out-of-tree readers may parse this field.
     head_type: str = "pointer"
     pointer_dim: int = 256
+    # The prompt format (prompting.RENDERS): "numbered" (the default) or "lettered", which goes
+    # with head_type "token_readout". A config without the key is "numbered".
+    render: str = "numbered"
     # Populated after `python -m training.evaluate calibrate` runs; 1.0 is a no-op. `temperature` is the
     # fallback; `temperature_by_kind` overrides it per primitive where fitted.
     # One global scalar cannot serve all three: noul/choice/score sit at very
@@ -108,7 +111,12 @@ class StrandsDeciderConfig:
     host_embeddings: bool = False
 
     def to_json(self) -> str:
-        return json.dumps(asdict(self), indent=2)
+        d = asdict(self)
+        # strands-decider 0.2.0 and earlier refuse a key they do not know: leave the default
+        # render out, so a numbered checkpoint's JSON stays the one they load.
+        if d["render"] == "numbered":
+            del d["render"]
+        return json.dumps(d, indent=2)
 
     @classmethod
     def from_json(cls, path: str) -> StrandsDeciderConfig:
@@ -123,12 +131,13 @@ class StrandsDeciderConfig:
         # Released checkpoints carry head_type="pointer" explicitly. A slot-era checkpoint
         # would set it to "slot": fail cleanly rather than silently loading as pointer.
         head_type = d.get("head_type")
-        if head_type is not None and head_type != "pointer":
+        if head_type is not None and head_type not in HEAD_TYPES:
             raise ValueError(
-                f"{path}: head_type={head_type!r}; this version loads pointer-head checkpoints only"
+                f"{path}: head_type={head_type!r}; this version loads pointer-head and "
+                "token-readout-head checkpoints only"
             )
-        # Drop any key the current dataclass does not know (e.g. legacy head_type="pointer",
-        # num_slots, head_hidden, head_init, kl_frozen_weight on a released config).
+        # Drop any key the current dataclass does not know (e.g. num_slots, head_hidden,
+        # head_init, kl_frozen_weight on a released config).
         allowed = set(cls.__dataclass_fields__)
         d = {k: v for k, v in d.items() if k in allowed}
         return cls(**d)
@@ -238,13 +247,53 @@ class PointerHead(nn.Module):
         return (o @ d).squeeze(-1) * self.scale
 
 
+class TokenReadoutHead(nn.Module):
+    """A token readout: Linear(hidden, 255), no bias, no LayerNorm.
+
+    It reads the last-token state, the torso's final-norm output (Qwen and Gemma apply their
+    last RMSNorm before `last_hidden_state`). Row k scores the option listed under code k
+    (prompting.OPTION_CODES), so unlike PointerHead it has a per-slot parameter and an option
+    ceiling of 255. Rows past the largest option count seen in training get no gradient.
+    Random init, as nn.Linear.
+
+    It takes the pointer head's arguments so every caller runs both unchanged: `options`
+    gives only the width, the batch's widest question, and the logits are trimmed to it.
+    """
+
+    def __init__(self, hidden_size: int, dropout: float = 0.0):
+        super().__init__()
+        from .prompting import NUM_OPTION_CODES
+
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.proj = nn.Linear(hidden_size, NUM_OPTION_CODES, bias=False)
+
+    def forward(self, decide: torch.Tensor, options: torch.Tensor) -> torch.Tensor:
+        """decide [B, d], options [B, K, d] -> logits [B, K]."""
+        k = options.size(1)
+        if k > self.proj.out_features:
+            raise ValueError(
+                f"{k} options; the token readout head has {self.proj.out_features} slots"
+            )
+        logits: torch.Tensor = self.proj(self.dropout(decide))
+        return logits[:, :k]
+
+
+HEAD_TYPES = ("pointer", "token_readout")
+
+
 def build_head(config: StrandsDeciderConfig, hidden_size: int) -> nn.Module:
-    """The pointer readout, in fp32.
+    """The readout `config.head_type` names, in fp32.
 
     The head trains in fp32 even when the torso is bf16: it is tiny, and a
     low-precision classifier is a needless source of calibration error.
     """
-    head = PointerHead(hidden_size, dim=config.pointer_dim, dropout=config.head_dropout)
+    head: nn.Module
+    if config.head_type == "pointer":
+        head = PointerHead(hidden_size, dim=config.pointer_dim, dropout=config.head_dropout)
+    elif config.head_type == "token_readout":
+        head = TokenReadoutHead(hidden_size, dropout=config.head_dropout)
+    else:
+        raise ValueError(f"unknown head_type {config.head_type!r}")
     return head.to(torch.float32)
 
 
@@ -307,7 +356,7 @@ def apply_temperature(logits: torch.Tensor, temperature: Any) -> torch.Tensor:
 
 
 class StrandsDeciderModel(nn.Module):
-    """LLM torso + pointer head. The LM output head is never loaded."""
+    """LLM torso + readout head. The LM output head is never loaded."""
 
     def __init__(self, config: StrandsDeciderConfig, torso: nn.Module, tokenizer: Any):
         super().__init__()

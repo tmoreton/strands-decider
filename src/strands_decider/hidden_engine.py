@@ -193,6 +193,8 @@ def save_assets(model: StrandsDeciderModel, path: str, model_name: str) -> None:
     from safetensors.numpy import save_file
 
     cfg = model.config
+    if cfg.head_type != "pointer" or cfg.render != "numbered":
+        raise ValueError("the hidden-state engine serves a pointer head on render numbered only")
     os.makedirs(path, exist_ok=True)
     model.tokenizer.backend_tokenizer.save(os.path.join(path, "tokenizer.json"))
     weights = {k: v.detach().float().cpu().numpy() for k, v in model.head.state_dict().items()}

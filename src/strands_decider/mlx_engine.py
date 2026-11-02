@@ -157,6 +157,7 @@ class MLXEngine(SystemOneEngine):
         self._executor = executor
         self._prefix_cache_unforkable = False
         self._tok_lock = threading.Lock()
+        self._set_render()
 
     def evaluate(self, request: SystemOneRequest) -> SystemOneResponse:
         return self._executor.submit(super().evaluate, request).result()

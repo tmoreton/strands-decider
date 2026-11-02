@@ -45,6 +45,49 @@ NOUL_DEFAULT_CRITERIA = {
     "true": "the statement holds for this state",
 }
 
+# The prompt formats. "numbered" is the default: tagged text, options `1.`, `2.`, ..., read
+# at `<answer>`. "lettered" is the tokenizer's chat template with thinking off, a user turn
+# with State / Question / Options, the options under letter codes A, B, ..., read at the last
+# token of the generation prompt. It needs the tokenizer (`chat_frame`).
+RENDERS = ("numbered", "lettered")
+LETTERED_SYSTEM = (
+    "Classify the supplied state. Select the one option that answers the question. "
+    "Reply with only the selected option code."
+)
+LETTERED_INSTRUCTION = "Return only the letter code of the best option."
+NUM_OPTION_CODES = 255  # the schema's option limit
+
+
+def option_code(k: int) -> str:
+    """The k-th letter code (0-based): A ... Z, AA ... AZ, BA ..., as spreadsheet columns."""
+    code = ""
+    k += 1
+    while k:
+        k, r = divmod(k - 1, 26)
+        code = chr(65 + r) + code
+    return code
+
+
+OPTION_CODES = tuple(option_code(k) for k in range(NUM_OPTION_CODES))  # A ... IU
+
+
+def chat_frame(tok: Any) -> tuple[str, str]:
+    """The chat template text before and after the user turn's content, for render "lettered".
+
+    The template writes its own BOS, so a lettered prompt is tokenised without special tokens.
+    """
+    mark = "\x00USER\x00"
+    text = tok.apply_chat_template(
+        [{"role": "system", "content": LETTERED_SYSTEM}, {"role": "user", "content": mark}],
+        add_generation_prompt=True,
+        enable_thinking=False,
+        tokenize=False,
+    )
+    head, sep, tail = text.partition(mark)
+    if not sep:
+        raise ValueError("the chat template dropped the user content")
+    return head, tail
+
 
 def render_content(content: Content | None) -> str:
     """Flatten a state or instruction into text, stably.
@@ -83,8 +126,11 @@ class RenderedQuestion:
         return len(self.slot_labels)
 
 
-def _option_block(pairs: Sequence[tuple[str, str]]) -> tuple[str, list[tuple[int, int]]]:
-    """Number options from 1 so slot k <-> the line reading `k+1.`.
+def _option_block(
+    pairs: Sequence[tuple[str, str]], render: str = "numbered"
+) -> tuple[str, list[tuple[int, int]]]:
+    """Number options from 1 so slot k <-> the line reading `k+1.`; with render "lettered",
+    label them `A: name: description`, so slot k <-> code k.
 
     Also returns each line's (start, end) character span within the block. Descriptions
     are collapsed to a single line so one option is always exactly one line, which is
@@ -95,7 +141,10 @@ def _option_block(pairs: Sequence[tuple[str, str]]) -> tuple[str, list[tuple[int
     cursor = 0
     for i, (name, desc) in enumerate(pairs):
         desc = " ".join((desc or "").split())
-        line = f"{i + 1}. {name}" + (f" \u2014 {desc}" if desc else "")
+        if render == "lettered":
+            line = f"{OPTION_CODES[i]}: {name}" + (f": {desc}" if desc else "")
+        else:
+            line = f"{i + 1}. {name}" + (f" \u2014 {desc}" if desc else "")
         lines.append(line)
         spans.append((cursor, cursor + len(line)))
         cursor += len(line) + 1  # the joining newline
@@ -106,12 +155,16 @@ def render_question(
     question: Question,
     *,
     option_order: Sequence[int] | None = None,
+    render: str = "numbered",
+    frame: tuple[str, str] | None = None,
 ) -> RenderedQuestion:
     """Render one question. `option_order` permutes the options (training augmentation).
 
     The permutation is applied to the *rendered* list, and slot_labels records the
     resulting binding, so callers never have to track the permutation themselves.
+    `render="lettered"` needs `frame` (`chat_frame`); its text ends with the frame's tail.
     """
+    _check_render(render, frame)
     instructions = render_content(question.instructions)
 
     if isinstance(question, NoulQuestion):
@@ -136,9 +189,15 @@ def render_question(
             raise ValueError("option_order must be a permutation of the option indices")
         pairs = [pairs[i] for i in option_order]
 
-    block, block_spans = _option_block(pairs)
-    prefix = f'<question type="{kind}">\n{header}\n{instructions}\n<options>\n'
-    text = prefix + block + "\n</options>\n</question>\n<answer>"
+    if render == "lettered":
+        assert frame is not None
+        block, block_spans = _option_block(pairs, render)
+        prefix = f"Question:\n{instructions}\n\nOptions:\n"
+        text = prefix + block + f"\n\n{LETTERED_INSTRUCTION}" + frame[1]
+    else:
+        block, block_spans = _option_block(pairs)
+        prefix = f'<question type="{kind}">\n{header}\n{instructions}\n<options>\n'
+        text = prefix + block + "\n</options>\n</question>\n<answer>"
     base = len(prefix)
     return RenderedQuestion(
         text=text,
@@ -149,15 +208,29 @@ def render_question(
     )
 
 
-def render_state(state: Content) -> str:
+def _check_render(render: str, frame: tuple[str, str] | None) -> None:
+    if render not in RENDERS:
+        raise ValueError(f"unknown render {render!r}")
+    if render == "lettered" and frame is None:
+        raise ValueError('render "lettered" needs the chat template frame (chat_frame)')
+
+
+def render_state(
+    state: Content, render: str = "numbered", frame: tuple[str, str] | None = None
+) -> str:
     """The shared prefix. Everything before this point is identical across the
-    questions in one request, which is exactly what infer.py caches once."""
+    questions in one request, which is exactly what infer.py caches once. With render
+    "lettered" it is the chat template's head and the user turn's State block."""
+    _check_render(render, frame)
+    if render == "lettered":
+        assert frame is not None
+        return f"{frame[0]}State:\n{render_content(state)}\n\n"
     return f"<state>\n{render_content(state)}\n</state>\n"
 
 
 def build_prompt(state: Content, question: Question, **kw: Any) -> tuple[str, RenderedQuestion]:
     rq = render_question(question, **kw)
-    return render_state(state) + rq.text, rq
+    return render_state(state, kw.get("render", "numbered"), kw.get("frame")) + rq.text, rq
 
 
 def read_noul(probs: Sequence[float], rq: RenderedQuestion) -> float:
@@ -202,6 +275,8 @@ def fit_window(
     state_text: str,
     question_texts: list[str],
     max_length: int,
+    *,
+    add_special_tokens: bool = True,
 ) -> tuple[list[int], list[list[int]], list[list[tuple[int, int]]]]:
     """Tokenize a state and its questions, refusing a prompt that does not fit a window of
     `max_length` tokens.
@@ -209,7 +284,8 @@ def fit_window(
     Returns the state's ids, each question's ids, and each question's character offsets.
     `tok` is a `tokenizers.Tokenizer`, such as a Hugging Face fast tokenizer's
     `backend_tokenizer`. This function turns its padding and truncation off, so callers
-    must not run it on one tokenizer from two threads at once.
+    must not run it on one tokenizer from two threads at once. `add_special_tokens=False` encodes the state as it is,
+    for a render whose text already holds its BOS (render "lettered").
     """
     tok.no_padding()
     tok.no_truncation()
@@ -217,7 +293,7 @@ def fit_window(
     q = [e.ids for e in encodings]
     offsets = [list(e.offsets) for e in encodings]
     longest = max(len(x) for x in q)
-    s = tok.encode(state_text, add_special_tokens=True).ids
+    s = tok.encode(state_text, add_special_tokens=add_special_tokens).ids
     if len(s) + longest > max_length:
         raise ValueError(
             f"prompt of {len(s) + longest} tokens ({len(s)} state + {longest} question) "

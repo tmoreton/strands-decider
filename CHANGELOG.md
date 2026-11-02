@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `head_type: token_readout` and `render: lettered`: an opt-in token readout head, a trained
+  `Linear(hidden, 255)` with one row for each listed option code, read at the last token of a
+  chat-template prompt with letter option codes
+  ([docs/architecture.md](docs/architecture.md#readouts-pointer-default-and-token-readout)). The
+  pointer readout stays the default, and its outputs do not change.
+
 ## Model names (2026-10)
 
 Model names now use the pattern `strands-decider-<size>-<base>-v<N>-<YYMM>`:

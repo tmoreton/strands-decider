@@ -137,7 +137,8 @@ def collect_logits(
     model = SystemOneEngine(model, EngineConfig(device=device)).model
     coll = SystemOneCollator(
         model.tokenizer,
-        CollatorConfig(max_length=max_length),
+        # The test stubs carry no render.
+        CollatorConfig(max_length=max_length, render=getattr(model.config, "render", "numbered")),
         train=False,  # no option shuffling: evaluation must be deterministic
     )
     loader = DataLoader(

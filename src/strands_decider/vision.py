@@ -400,6 +400,8 @@ class VisionEngine(SystemOneEngine):
         image_processor: Any = None,
     ):
         super().__init__(model, config or VisionEngineConfig())
+        if self.frame is not None:  # render_image_state has the numbered layout only
+            raise ValueError('the vision engine serves render "numbered" only, not "lettered"')
         self.vcfg: VisionEngineConfig = (
             self.cfg if isinstance(self.cfg, VisionEngineConfig) else VisionEngineConfig()
         )

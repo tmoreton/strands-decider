@@ -19,7 +19,7 @@ import math
 import os
 import random
 import time
-from dataclasses import MISSING, asdict, dataclass, field
+from dataclasses import MISSING, asdict, dataclass, field, replace
 from typing import Any
 
 import torch
@@ -27,6 +27,7 @@ import typer
 from torch.utils.data import DataLoader, Dataset
 
 from strands_decider.modeling import (
+    HEAD_TYPES,
     StrandsDeciderConfig,
     StrandsDeciderModel,
     checkpoint_dir,
@@ -68,6 +69,10 @@ class TrainConfig:
     # (modeling.HostEmbedding). For one GPU: under torchrun every rank would hold a copy.
     host_embeddings: bool = False
     freeze_torso: bool = False
+    # The readout: "pointer" (the default) or "token_readout", a token readout
+    # (modeling.TokenReadoutHead), which goes with render "lettered" (prompting.RENDERS).
+    head_type: str = "pointer"
+    render: str = "numbered"
     pointer_dim: int = 256
     # A frozen teacher's option distribution per training row (data/teacher.py): JSONL of
     # {"i": row index in the concatenated train_files, "probs": [...canonical order]}.
@@ -155,12 +160,13 @@ class TrainConfig:
             raw = yaml.safe_load(fh) or {}
         # Model-architecture fields the slot head owned, which the v1-2610 and earlier YAMLs
         # still carry. Drop them silently so a historical recipe retrains with the current
-        # pointer-only architecture; a typo in any other key still raises.
+        # architecture; a typo in any other key still raises.
         known = set(cls.__dataclass_fields__)
         for k, v in raw.items():
-            if k == "head_type" and v != "pointer":
+            if k == "head_type" and v not in HEAD_TYPES:
                 raise ValueError(
-                    f"{path}: head_type={v!r}; this version trains pointer-head checkpoints only"
+                    f"{path}: head_type={v!r}; this version trains pointer-head and "
+                    "token-readout-head checkpoints only"
                 )
             if k not in known and k not in RETIRED_YAML_KEYS:
                 raise ValueError(f"{path}: unknown config key {k!r}")
@@ -172,12 +178,14 @@ class TrainConfig:
 
 # Slot-era TrainConfig keys the current dataclass no longer carries. Dropped silently by
 # from_yaml so a published recipe still parses; a typo in any other key raises.
-RETIRED_YAML_KEYS = frozenset({"num_slots", "head_type", "head_hidden", "head_init"})
+RETIRED_YAML_KEYS = frozenset({"num_slots", "head_hidden", "head_init"})
 
 
 # The fields of a TrainConfig that a checkpoint fixes: with init_from they are the checkpoint's.
 INIT_FROM_ARCH = (
     "base_model",
+    "head_type",
+    "render",
     "pointer_dim",
     "use_lora",
     "lora_r",
@@ -381,12 +389,15 @@ def _frozen_reference(
     a row's option count are -inf. The reference renders with its own tokenizer, so it may
     have another than the student's (a Gemma student, a Qwen reference): a fresh collator
     with the reference's tokenizer draws the same option permutation from its seed before
-    any tokenisation, so both see each row with the same options in the same slots.
+    any tokenisation, so both see each row with the same options in the same slots. For the
+    same reason the reference renders in its own prompt format: a pointer reference under a
+    token readout student reads its numbered render, with the student's option order.
 
     Under torchrun rank m % world renders micro-batch m (the others only draw its
     augmentations) and a sum over ranks assembles the table.
     """
     rank, _, world = distributed.env()
+    coll_cfg = replace(coll_cfg, render=ref_model.config.render)
     coll = SystemOneCollator(ref_model.tokenizer, coll_cfg, train=True)
     width = max(max(examples[i].n_options for i in b) for b in batches)
     ref = torch.zeros(len(batches), max(map(len, batches)), width, device=device)
@@ -480,6 +491,8 @@ def train(cfg: TrainConfig) -> str:
             # score confidence; without it a score could never reach high confidence.
             ordinal_smoothing=cfg.ordinal_smoothing,
             pointer_dim=cfg.pointer_dim,
+            head_type=cfg.head_type,
+            render=cfg.render,
         )
         if cfg.lora_targets:
             model_cfg.lora_targets = list(cfg.lora_targets)
@@ -555,6 +568,7 @@ def train(cfg: TrainConfig) -> str:
         ordinal_smoothing=cfg.ordinal_smoothing,
         reverse_score_prob=cfg.reverse_score_prob,
         seed=cfg.seed,
+        render=cfg.render,
     )
     train_collate = SystemOneCollator(model.tokenizer, coll_cfg, train=True)
     if cfg.group_by_length:

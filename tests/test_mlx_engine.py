@@ -27,7 +27,7 @@ if not hasattr(transformers, "Qwen3_5TextConfig"):
 
 from strands_decider.infer import load_engine  # noqa: E402
 from strands_decider.modeling import StrandsDeciderConfig, StrandsDeciderModel  # noqa: E402
-from strands_decider.prompting import render_question, render_state  # noqa: E402
+from strands_decider.prompting import chat_frame, render_question, render_state  # noqa: E402
 from strands_decider.schema import (  # noqa: E402
     ChoiceQuestion,
     NoulQuestion,
@@ -77,25 +77,37 @@ REQUESTS = [  # one question (the whole-prompt path) and several (the shared-pre
 ]
 
 
-def _tokenizer():
+# A stand-in chat template for render "lettered": a system turn, a user turn, the reply's start.
+TEMPLATE = (
+    "{% for m in messages %}<turn> {{ m['role'] }} {{ m['content'] }} </turn> {% endfor %}"
+    "{% if add_generation_prompt %}<turn> model {% endif %}"
+)
+
+
+def _tokenizer(render="numbered"):
     """A word-level tokenizer whose vocabulary covers every rendered prompt, so no position is <unk>."""
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import PreTrainedTokenizerFast
 
-    texts = [render_state(r.state) for r in REQUESTS] + [
-        render_question(q).text for q in QUESTIONS.values()
+    kw = {}
+    if render == "lettered":
+        kw = {"render": render, "frame": chat_frame(_tokenizer())}
+    texts = [render_state(r.state, render, kw.get("frame")) for r in REQUESTS] + [
+        render_question(q, **kw).text for q in QUESTIONS.values()
     ]
     words = {w for text in texts for w, _ in pre_tokenizers.Whitespace().pre_tokenize_str(text)}
     vocab = {w: i for i, w in enumerate(["<pad>", "<eos>", "<unk>", *sorted(words)])}
     tok = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
     tok.pre_tokenizer = pre_tokenizers.Whitespace()
-    return PreTrainedTokenizerFast(
+    out = PreTrainedTokenizerFast(
         tokenizer_object=tok, pad_token="<pad>", eos_token="<eos>", unk_token="<unk>"
     )
+    out.chat_template = TEMPLATE
+    return out
 
 
-def _checkpoint(tmp_path, torch_dtype="float32"):
-    tok = _tokenizer()
+def _checkpoint(tmp_path, torch_dtype="float32", **over):
+    tok = _tokenizer(over.get("render", "numbered"))
     torch.manual_seed(0)
     base_cfg = transformers.Qwen3_5TextConfig(
         vocab_size=len(tok),
@@ -122,6 +134,7 @@ def _checkpoint(tmp_path, torch_dtype="float32"):
         lora_r=4,
         lora_alpha=8,
         lora_targets=LORA_TARGETS,
+        **over,
     )
     torso = transformers.Qwen3_5ForCausalLM.from_pretrained(base).model
     model = StrandsDeciderModel(cfg, torso, tok)
@@ -170,6 +183,22 @@ def test_mlx_answers_as_torch_does(engines, request_index, device):
     assert have.keys() == want.keys()
     for name in want:
         assert have[name] == pytest.approx(want[name], abs=1.5e-4), name  # rounded to 4 places
+
+
+def test_a_token_readout_checkpoint_answers_on_mlx_as_on_torch(tmp_path):
+    path = _checkpoint(tmp_path, head_type="token_readout", render="lettered")
+    torch_engine, mlx_engine = (
+        load_engine(str(path), device="cpu"),
+        load_engine(str(path), device="mlx"),
+    )
+    try:
+        for request in REQUESTS:
+            want, have = (_probabilities(e.evaluate(request)) for e in (torch_engine, mlx_engine))
+            assert have.keys() == want.keys()
+            for name in want:
+                assert have[name] == pytest.approx(want[name], abs=1.5e-4), name
+    finally:
+        mlx_engine.close()
 
 
 def test_the_prefix_path_matches_whole_prompts_and_leaves_no_state(engines):

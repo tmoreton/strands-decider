@@ -31,6 +31,7 @@ from . import __version__
 from .modeling import StrandsDeciderModel, apply_temperature, masked_log_softmax, pool_last_token
 from .prompting import (
     RenderedQuestion,
+    chat_frame,
     fit_window,
     option_token_index,
     render_question,
@@ -168,6 +169,7 @@ class SystemOneEngine:
             self._upcast_torso_for_cpu()
         self.tok = model.tokenizer
         self.device = self.cfg.device
+        self._set_render()
         # Sticky, monotonic False->True: cache the first UnforkableCache so later
         # requests skip the shared-prefix path without racing on self.cfg.
         self._prefix_cache_unforkable = False
@@ -176,6 +178,12 @@ class SystemOneEngine:
         # "Already borrowed", or silently uses another thread's max_length).
         # Tokenisation is cheap relative to the model forward, so holding this is fine.
         self._tok_lock = threading.Lock()
+
+    def _set_render(self) -> None:
+        """The checkpoint's prompt format; a lettered prompt's state holds its own BOS."""
+        cfg = getattr(self.model, "config", None)  # test stubs carry no config or no render
+        self.render = getattr(cfg, "render", "numbered")
+        self.frame = chat_frame(self.tok) if self.render == "lettered" else None
 
     def _upcast_torso_for_cpu(self) -> None:
         """Run a half-precision torso in fp32 on CPU.
@@ -217,6 +225,7 @@ class SystemOneEngine:
                 state_text,
                 question_texts,
                 self.model.config.max_length,
+                add_special_tokens=self.frame is None,
             )
 
     def _option_idx(
@@ -344,9 +353,11 @@ class SystemOneEngine:
         names = list(request.questions.keys())
         questions: list[Question] = [request.questions[n] for n in names]
 
-        rendered: list[RenderedQuestion] = [render_question(q) for q in questions]
+        rendered: list[RenderedQuestion] = [
+            render_question(q, render=self.render, frame=self.frame) for q in questions
+        ]
 
-        state_text = render_state(request.state)
+        state_text = render_state(request.state, self.render, self.frame)
         n_slots = [rq.n_slots for rq in rendered]
 
         answers: dict[str, Answer] = {}

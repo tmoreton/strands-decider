@@ -173,6 +173,68 @@ genericity is lost. With it, the only strategy that survives gradient descent is
 actually reading the option text. Score questions are the exception — their slots are
 ordinal, so they are only ever *reversed* (rubric and label together), never permuted.
 
+## Readouts: pointer (default) and token readout
+
+Two readouts are available. The `head_type` and `render` fields of the checkpoint config
+select them. The defaults are `head_type: pointer` and `render: numbered`, and every released
+checkpoint uses them.
+
+The **pointer** readout is the one this document describes above. It compares the hidden state
+at `<answer>` with the hidden state at the last token of each option's line. It has no
+parameter for an option position, and no limit on the number of options.
+
+The **token readout** is a trained linear readout with one row for each listed option code. It
+reads the hidden state at the last prompt token. It has two parts:
+
+- **The render** (`render: lettered`, `prompting.py`). The prompt goes through the tokenizer's
+  chat template, with thinking off. A system turn tells the model to reply with one option
+  code. The user turn holds three blocks, `State:`, `Question:` and `Options:`, with one option
+  per line as `A: name: description`. The codes are `A` to `Z`, then `AA`, `AB` and so on, to
+  `IU` (255 codes). The prompt ends with the template's generation prompt.
+- **The head** (`head_type: token_readout`, `TokenReadoutHead` in `modeling.py`). One linear layer,
+  `Linear(hidden, 255)`, with no bias and no LayerNorm. It reads the hidden state of the last
+  prompt token, which is the torso's final-norm output. Row k gives the logit of the option
+  under code k. The rows past the question's option count are masked before the softmax, as
+  for the pointer head.
+
+```
+<chat template: the system turn, then the start of the user turn>State:
+Help! My payouts have been failing for 3 days.
+
+Question:
+Which team should handle this?
+
+Options:
+A: billing: payments, invoices, payouts
+B: technical: bugs, outages, API errors
+C: sales: pricing and upgrades
+
+Return only the letter code of the best option.<chat template: end of the user turn, generation prompt>
+```
+
+The important difference is the parameter for each position. The token readout head has one
+row for each position in the option list, so row k can learn a bias for position k, and option
+shuffling must remove it. A row that no training example reaches gets no gradient: if the
+training set has no question with more than N options, the rows past N stay near their random
+initial values. The pointer head has neither problem. On the other side, the token readout
+head reads one position only, so a serving stack that gives only the last hidden state can
+serve it. The pointer head needs the hidden state of each option too.
+
+The head reads the last prompt token, not the code tokens, so a code does not have to be one
+token. In the Qwen3.5 tokenizer, 237 of the 255 codes are one token; in the Gemma 4 tokenizer,
+254. `A` to `X` are one token in both.
+
+Set both fields together, in the training YAML: `head_type: token_readout` and
+`render: lettered`. Training, the frozen-KL reference, calibration, evaluation, the soup, the
+Hugging Face export, `strands-decider serve` and the MLX engine support both readouts. The
+vision engine and the hidden-state engine (`hidden_engine.py`) serve only the pointer head on
+the numbered render, and refuse a token readout checkpoint. A frozen-KL reference uses its own
+render: a pointer reference under a token readout student reads the numbered prompt, with the
+student's option order. A lettered prompt is longer than the numbered prompt of the same row,
+and the collator refuses a lettered prompt longer than `max_length` instead of cutting the read
+position. The config of a numbered checkpoint has no `render` key, so strands-decider 0.2.0 and
+earlier still load it.
+
 ## Design decisions worth knowing
 
 **Causal attention, read at the right tokens.** The note sketching this architecture likened
@@ -222,7 +284,7 @@ encoding rather than guess whether it has a batch dimension.
 src/strands_decider/              -- published package (inference only)
   schema.py       wire types; the confidence formula
   prompting.py    state/question rendering; slot <-> option binding
-  modeling.py     LLM torso (Qwen3 or hybrid Qwen3.5) + pointer (or slot) readout;
+  modeling.py     LLM torso (Qwen3 or hybrid Qwen3.5) + pointer (or token) readout;
                   masked softmax; KL reference; is_hybrid
   infer.py        serving engine; shared-state cache, including hybrid torsos
   mps_kernels.py  Gated DeltaNet chunk rule for Apple-silicon serving (no fla on macOS)

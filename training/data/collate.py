@@ -16,7 +16,7 @@ from typing import Any
 
 import torch
 
-from strands_decider.prompting import build_prompt
+from strands_decider.prompting import build_prompt, chat_frame
 
 from .format import Example
 
@@ -24,6 +24,10 @@ from .format import Example
 @dataclass
 class CollatorConfig:
     max_length: int = 3072
+    # The prompt format (prompting.RENDERS). It draws no random numbers, so two collators of
+    # one seed that differ only in render show every row with the same options in the same
+    # slots: train._frozen_reference relies on that.
+    render: str = "numbered"
     shuffle_options: bool = True
     # Score levels are ordered, so they are never permuted -- but reversing the whole
     # rubric (and the label with it) is meaning-preserving and doubles the orderings seen.
@@ -44,6 +48,7 @@ class SystemOneCollator:
         self.cfg = config
         self.train = train
         self.rng = random.Random(config.seed)
+        self.frame = chat_frame(tokenizer) if config.render == "lettered" else None
 
     # ---- option ordering -------------------------------------------------
 
@@ -171,6 +176,8 @@ class SystemOneCollator:
                 ex.state,
                 ex.to_question(self._instruction(ex)),
                 option_order=order,
+                render=self.cfg.render,
+                frame=self.frame,
             )
             texts.append(prompt)
             # Option spans are relative to the question; the prompt is state + question.
@@ -194,7 +201,19 @@ class SystemOneCollator:
             # and the shared-prefix cache in infer.py assumes the prompt starts at 0.
             padding_side="right",
             return_offsets_mapping=True,
+            # The chat template of a lettered prompt writes its own BOS.
+            add_special_tokens=self.frame is None,
         )
+        if self.frame is not None:
+            # Truncation cuts from the right, through the read position: refuse it rather
+            # than read the decision at an arbitrary token.
+            last = self.tok(self.frame[1], add_special_tokens=False)["input_ids"][-1]
+            n_real = enc["attention_mask"].sum(dim=1)
+            ends = enc["input_ids"].gather(1, (n_real - 1).unsqueeze(1)).squeeze(1)
+            if bool((ends != last).any()):
+                raise ValueError(
+                    f"a lettered prompt is longer than max_length {self.cfg.max_length}"
+                )
 
         out: dict[str, torch.Tensor] = {
             "input_ids": enc["input_ids"],
